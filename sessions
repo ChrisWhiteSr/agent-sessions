@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""sessions - list and resume Claude Code and Codex sessions across all directories.
+
+Usage:
+  sessions                     40 most recent sessions, newest first
+  sessions -n 100              show up to 100
+  sessions -a                  show every session
+  sessions --by-dir            group by directory instead (3 per dir, -n to change)
+  sessions -t claude|codex     one tool only
+  sessions -d docloop          only dirs whose path contains "docloop"
+  sessions -H                  also show headless runs (claude -p, codex exec)
+  sessions resume <id-prefix>  cd into the session's dir and resume it
+  sessions cmd <id-prefix>     print the shell command to resume it
+"""
+import argparse, json, os, sys, time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
+CLAUDE_HISTORY = os.path.join(HOME, ".claude", "history.jsonl")
+CODEX_INTERACTIVE = {"codex-tui", "codex_vscode"}
+HEAD_LINES = 400          # how far into a transcript to look for cwd + first prompt
+TITLE_LEN = 30
+DIR_LEN = 34
+
+def is_uuid(name):
+    parts = name.split("-")
+    return len(name) == 36 and [len(p) for p in parts] == [8, 4, 4, 4, 12]
+
+def clean_title(text):
+    text = " ".join(text.split())
+    return text if len(text) <= TITLE_LEN else text[:TITLE_LEN - 1] + "…"
+
+def junk_prompt(text):
+    t = text.lstrip()
+    return (not t or t.startswith("<") or t.startswith("# AGENTS.md")
+            or t.startswith("== hcom") or t.startswith("Caveat:"))
+
+def claude_interactive_ids():
+    """Sessions that had a prompt typed into the TUI land in history.jsonl; -p runs do not."""
+    ids = set()
+    if os.path.exists(CLAUDE_HISTORY):
+        with open(CLAUDE_HISTORY, errors="replace") as fh:
+            for line in fh:
+                try:
+                    sid = json.loads(line).get("sessionId")
+                    if sid: ids.add(sid)
+                except ValueError:
+                    pass
+    return ids
+
+def claude_sessions():
+    out = []
+    if not os.path.isdir(CLAUDE_PROJECTS):
+        return out
+    interactive = claude_interactive_ids()
+    for proj in os.scandir(CLAUDE_PROJECTS):
+        if not proj.is_dir():
+            continue
+        for f in os.scandir(proj.path):
+            if not (f.is_file() and f.name.endswith(".jsonl") and is_uuid(f.name[:-6])):
+                continue
+            sid = f.name[:-6]
+            cwd, title, n_user = None, None, 0
+            try:
+                with open(f.path, errors="replace") as fh:
+                    for i, line in enumerate(fh):
+                        if i > HEAD_LINES and cwd and title:
+                            break
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        if cwd is None and rec.get("cwd"):
+                            cwd = rec["cwd"]
+                        if rec.get("type") == "user" and not rec.get("isMeta"):
+                            content = (rec.get("message") or {}).get("content")
+                            if isinstance(content, str):
+                                n_user += 1
+                                if title is None and not junk_prompt(content):
+                                    title = clean_title(content)
+                            elif isinstance(content, list):
+                                texts = [c.get("text", "") for c in content
+                                         if isinstance(c, dict) and c.get("type") == "text"]
+                                if texts:
+                                    n_user += 1
+                                    if title is None and not junk_prompt(texts[0]):
+                                        title = clean_title(texts[0])
+            except OSError:
+                continue
+            if cwd is None:
+                # fall back to decoding the project dir name
+                cwd = "/" + proj.name.lstrip("-").replace("-", "/") + "  (guessed)"
+            out.append(dict(tool="claude", id=sid, cwd=cwd, mtime=f.stat().st_mtime,
+                            title=title or "(no prompt)", prompts=n_user,
+                            interactive=sid in interactive))
+    return out
+
+def codex_sessions():
+    out = []
+    if not os.path.isdir(CODEX_SESSIONS):
+        return out
+    names = {}
+    if os.path.exists(CODEX_INDEX):
+        with open(CODEX_INDEX, errors="replace") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    if rec.get("thread_name"):
+                        names[rec["id"]] = rec["thread_name"]
+                except ValueError:
+                    pass
+    for root, _dirs, files in os.walk(CODEX_SESSIONS):
+        for name in files:
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            path = os.path.join(root, name)
+            sid, cwd, title, n_user, originator = None, None, None, 0, ""
+            try:
+                with open(path, errors="replace") as fh:
+                    for i, line in enumerate(fh):
+                        if i > HEAD_LINES and sid and title:
+                            break
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        p = rec.get("payload") or {}
+                        if rec.get("type") == "session_meta":
+                            sid = p.get("id") or p.get("session_id")
+                            cwd = p.get("cwd")
+                            originator = p.get("originator", "")
+                        elif (rec.get("type") == "response_item" and p.get("type") == "message"
+                              and p.get("role") == "user"):
+                            texts = [c.get("text", "") for c in p.get("content", [])
+                                     if isinstance(c, dict) and c.get("type") == "input_text"]
+                            if texts and not junk_prompt(texts[0]):
+                                n_user += 1
+                                if title is None:
+                                    title = clean_title(texts[0])
+                        elif rec.get("type") == "event_msg" and p.get("type") == "user_message":
+                            msg = p.get("message", "")
+                            if not junk_prompt(msg):
+                                n_user += 1
+                                if title is None:
+                                    title = clean_title(msg)
+            except OSError:
+                continue
+            if not sid:
+                continue
+            out.append(dict(tool="codex", id=sid, cwd=cwd or "?", mtime=os.stat(path).st_mtime,
+                            title=(clean_title(names[sid]) if sid in names else title) or "(no prompt)", prompts=n_user,
+                            interactive=originator in CODEX_INTERACTIVE))
+    return out
+
+def age(ts):
+    d = time.time() - ts
+    if d < 3600:  return f"{int(d // 60)}m"
+    if d < 86400: return f"{int(d // 3600)}h"
+    return f"{int(d // 86400)}d"
+
+def short_dir(path):
+    return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+
+def resume_cmd(s):
+    q = "'" + s["cwd"].replace("'", "'\\''") + "'"
+    if s["tool"] == "claude":
+        return f"cd {q} && claude -r {s['id']}"
+    return f"cd {q} && codex resume {s['id']}"
+
+def load(tool_filter):
+    ss = []
+    if tool_filter in (None, "claude"): ss += claude_sessions()
+    if tool_filter in (None, "codex"):  ss += codex_sessions()
+    return ss
+
+def find(ss, prefix):
+    hits = [s for s in ss if s["id"].startswith(prefix)]
+    if not hits:
+        sys.exit(f"no session id starting with {prefix!r}")
+    if len(hits) > 1:
+        for h in hits:
+            print(f"  {h['tool']:6} {h['id']}  {short_dir(h['cwd'])}", file=sys.stderr)
+        sys.exit("ambiguous prefix, be more specific")
+    return hits[0]
+
+def trunc_dir(path):
+    d = short_dir(path)
+    return d if len(d) <= DIR_LEN else "…" + d[-(DIR_LEN - 1):]
+
+def print_row(s, show_dir=False):
+    flag = " " if s["interactive"] else "*"
+    d = f"{trunc_dir(s['cwd']):<{DIR_LEN}}  " if show_dir else ""
+    print(f" {flag}{s['tool']:6} {age(s['mtime']):>4}  {s['id'][:13]}  {d}{s['prompts']:>3}p  {s['title']}")
+
+def print_header(show_dir=False):
+    d = f"{'directory':<{DIR_LEN}}  " if show_dir else ""
+    print(f"  {'tool':6} {'age':>4}  {'id':13}  {d}{'':>3}   title")
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", nargs="?", default="list", choices=["list", "resume", "cmd"])
+    ap.add_argument("prefix", nargs="?")
+    ap.add_argument("-n", type=int, default=None,
+                    help="max rows (default 40), or per-directory count with --by-dir (default 3)")
+    ap.add_argument("-a", "--all", action="store_true", help="show every session")
+    ap.add_argument("-t", "--tool", choices=["claude", "codex"])
+    ap.add_argument("-d", "--dir", help="only directories containing this substring")
+    ap.add_argument("--by-dir", action="store_true", help="group by directory")
+    ap.add_argument("-H", "--headless", action="store_true",
+                    help="include headless runs (claude -p, codex exec); marked with *")
+    ap.add_argument("--min-prompts", type=int, default=1,
+                    help="hide sessions with fewer user prompts (default 1; use 0 to show all)")
+    args = ap.parse_args()
+
+    ss = load(args.tool)
+    if args.action in ("resume", "cmd"):
+        if not args.prefix:
+            sys.exit("need a session id prefix")
+        s = find(ss, args.prefix)
+        cmd = resume_cmd(s)
+        if args.action == "cmd":
+            print(cmd); return
+        print(f"→ {cmd}", file=sys.stderr)
+        os.chdir(s["cwd"])
+        argv = ["claude", "-r", s["id"]] if s["tool"] == "claude" else ["codex", "resume", s["id"]]
+        os.execvp(argv[0], argv)
+
+    ss = [s for s in ss if s["prompts"] >= args.min_prompts]
+    if not args.headless:
+        ss = [s for s in ss if s["interactive"]]
+    if args.dir:
+        ss = [s for s in ss if args.dir in s["cwd"] or args.dir in short_dir(s["cwd"])]
+    ss.sort(key=lambda s: -s["mtime"])
+    if not ss:
+        print("no sessions found"); return
+
+    if not args.by_dir:
+        limit = None if args.all else (args.n or 40)
+        rows = ss[:limit] if limit else ss
+        print_header(show_dir=True)
+        for s in rows:
+            print_row(s, show_dir=True)
+        if len(rows) < len(ss):
+            print(f"  … {len(ss) - len(rows)} more (-a for all, -n N for more)")
+    else:
+        per_dir = args.n or 3
+        groups = {}
+        for s in ss:
+            groups.setdefault(s["cwd"], []).append(s)
+        for cwd, items in groups.items():     # already newest-first by insertion
+            shown = items if args.all else items[:per_dir]
+            extra = len(items) - len(shown)
+            print(f"\n{short_dir(cwd)}  ({len(items)} session{'s' if len(items) != 1 else ''})")
+            for s in shown:
+                print_row(s)
+            if extra:
+                print(f"  … {extra} more:  sessions -a -d {short_dir(cwd)}")
+    note = "" if args.headless else "  (headless runs hidden; -H to include)"
+    print(f"\n{len(ss)} sessions{note}\nResume:  sessions resume <id>     Print command:  sessions cmd <id>")
+
+if __name__ == "__main__":
+    main()
