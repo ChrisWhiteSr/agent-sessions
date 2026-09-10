@@ -9,6 +9,7 @@ Usage:
   sessions -t claude|codex     one tool only
   sessions -d docloop          only dirs whose path contains "docloop"
   sessions -H                  also show headless runs (claude -p, codex exec)
+  sessions -s presquared       sessions whose prompts or replies mention "presquared"
   sessions resume <id-prefix>  cd into the session's dir and resume it
   sessions cmd <id-prefix>     print the shell command to resume it
 """
@@ -22,7 +23,8 @@ CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
 CLAUDE_HISTORY = os.path.join(HOME, ".claude", "history.jsonl")
 CODEX_INTERACTIVE = {"codex-tui", "codex_vscode"}
 HEAD_LINES = 400          # how far into a transcript to look for cwd + first prompt
-TITLE_LEN = 30
+TITLE_LEN = 60
+SNIPPET_LEN = 90
 DIR_LEN = 34
 
 def is_uuid(name):
@@ -93,7 +95,7 @@ def claude_sessions():
             if cwd is None:
                 # fall back to decoding the project dir name
                 cwd = "/" + proj.name.lstrip("-").replace("-", "/") + "  (guessed)"
-            out.append(dict(tool="claude", id=sid, cwd=cwd, mtime=f.stat().st_mtime,
+            out.append(dict(tool="claude", id=sid, cwd=cwd, mtime=f.stat().st_mtime, path=f.path,
                             title=title or "(no prompt)", prompts=n_user,
                             interactive=sid in interactive))
     return out
@@ -150,10 +152,66 @@ def codex_sessions():
                 continue
             if not sid:
                 continue
-            out.append(dict(tool="codex", id=sid, cwd=cwd or "?", mtime=os.stat(path).st_mtime,
+            out.append(dict(tool="codex", id=sid, cwd=cwd or "?", mtime=os.stat(path).st_mtime, path=path,
                             title=(clean_title(names[sid]) if sid in names else title) or "(no prompt)", prompts=n_user,
                             interactive=originator in CODEX_INTERACTIVE))
     return out
+
+def conversation_texts(rec, tool):
+    """Yield the human-readable text of a transcript record: user prompts and assistant replies only.
+    Tool results, attachments and injected system context are skipped so a search term that
+    happens to live in a memory file or a file path does not match every session."""
+    if tool == "claude":
+        if rec.get("type") not in ("user", "assistant") or rec.get("isMeta"):
+            return
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            if not junk_prompt(content):
+                yield content
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text" and not junk_prompt(c.get("text", "")):
+                    yield c["text"]
+    else:
+        p = rec.get("payload") or {}
+        if rec.get("type") == "response_item" and p.get("type") == "message":
+            for c in p.get("content", []):
+                if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
+                    if not junk_prompt(c.get("text", "")):
+                        yield c["text"]
+
+def search_session(s, term):
+    """Return (hit_count, snippet) for a case-insensitive term, or (0, None)."""
+    needle = term.lower()
+    hits, snippet = 0, None
+    try:
+        with open(s["path"], errors="replace") as fh:
+            for line in fh:
+                if needle not in line.lower():        # cheap pre-check before JSON parsing
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                for text in conversation_texts(rec, s["tool"]):
+                    low = text.lower()
+                    i = low.find(needle)
+                    while i != -1:
+                        hits += 1
+                        if snippet is None:
+                            start = max(0, i - SNIPPET_LEN // 3)
+                            frag = " ".join(text[start:start + SNIPPET_LEN].split())
+                            snippet = ("…" if start else "") + frag + ("…" if start + SNIPPET_LEN < len(text) else "")
+                        i = low.find(needle, i + len(needle))
+    except OSError:
+        pass
+    return hits, snippet
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def c(code, text):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+DIM, BOLD, CYAN, YELLOW, GREEN, MAGENTA = "2", "1", "36", "33", "32", "35"
+TOOL_COLOR = {"claude": "38;5;173", "codex": "38;5;114"}   # muted orange, soft green
 
 def age(ts):
     d = time.time() - ts
@@ -190,14 +248,52 @@ def trunc_dir(path):
     d = short_dir(path)
     return d if len(d) <= DIR_LEN else "…" + d[-(DIR_LEN - 1):]
 
-def print_row(s, show_dir=False):
-    flag = " " if s["interactive"] else "*"
-    d = f"{trunc_dir(s['cwd']):<{DIR_LEN}}  " if show_dir else ""
-    print(f" {flag}{s['tool']:6} {age(s['mtime']):>4}  {s['id'][:13]}  {d}{s['prompts']:>3}p  {s['title']}")
+def highlight(text, term, restore=None):
+    """Colour the first occurrence of term; `restore` re-applies an outer style after the reset."""
+    if not (term and USE_COLOR):
+        return text
+    i = text.lower().find(term.lower())
+    if i == -1:
+        return text
+    tail = (f"\033[{restore}m" if restore else "") + text[i + len(term):]
+    return text[:i] + c(YELLOW, text[i:i + len(term)]) + tail
+
+def print_row(s, show_dir=False, term=None):
+    flag = " " if s["interactive"] else c(DIM, "*")
+    tool = c(TOOL_COLOR[s["tool"]], f"{s['tool']:6}")
+    d = c(DIM, f"{trunc_dir(s['cwd']):<{DIR_LEN}}") + "  " if show_dir else ""
+    print(f" {flag}{tool} {age(s['mtime']):>4}  {c(CYAN, s['id'][:13])}  {d}{s['prompts']:>3}p  {highlight(s['title'], term)}")
+    if term and s.get("snippet"):
+        indent = " " * (28 + (DIR_LEN + 2 if show_dir else 0))
+        hits = f"{s['hits']} hit" + ("s" if s["hits"] != 1 else "")
+        print(f"{indent}{c(DIM, hits)}  {c(DIM, highlight(s['snippet'], term, restore=DIM))}")
 
 def print_header(show_dir=False):
     d = f"{'directory':<{DIR_LEN}}  " if show_dir else ""
-    print(f"  {'tool':6} {'age':>4}  {'id':13}  {d}{'':>3}   title")
+    print(c(DIM, f"  {'tool':6} {'age':>4}  {'id':13}  {d}{'':>3}   title"))
+
+FLAG_HELP = [
+    ("-s TERM", "search prompts and replies for TERM (case-insensitive)"),
+    ("-d PATH", "only sessions whose directory contains PATH"),
+    ("-t claude|codex", "one tool only"),
+    ("-n N", "show N rows (default 40); per directory with --by-dir"),
+    ("-a", "show everything"),
+    ("-H", "include headless runs (claude -p, codex exec), marked *"),
+    ("--by-dir", "group by directory instead of one time-sorted list"),
+    ("--min-prompts N", "hide sessions with fewer than N prompts"),
+    ("resume ID", "cd into that session's directory and resume it"),
+    ("cmd ID", "print the resume command instead of running it"),
+]
+
+def print_footer(shown, total, headless):
+    print()
+    note = "" if headless else c(DIM, "   (headless runs hidden, add -H)")
+    count = f"{shown} of {total}" if shown != total else f"{total}"
+    print(f"{c(BOLD, count)} sessions{note}")
+    print(c(DIM, "flags"))
+    for flag, desc in FLAG_HELP:
+        print(f"  {c(CYAN, f'{flag:16}')} {c(DIM, desc)}")
+    print(f"  {c(DIM, 'IDs may be shortened to any unique prefix, e.g.')} {c(CYAN, 'sessions resume 01a081')}")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -211,9 +307,15 @@ def main():
     ap.add_argument("--by-dir", action="store_true", help="group by directory")
     ap.add_argument("-H", "--headless", action="store_true",
                     help="include headless runs (claude -p, codex exec); marked with *")
+    ap.add_argument("-s", "--search", metavar="TERM",
+                    help="only sessions whose prompts or replies contain TERM (case-insensitive)")
+    ap.add_argument("--no-color", action="store_true", help="plain output")
     ap.add_argument("--min-prompts", type=int, default=1,
                     help="hide sessions with fewer user prompts (default 1; use 0 to show all)")
     args = ap.parse_args()
+    global USE_COLOR
+    if args.no_color:
+        USE_COLOR = False
 
     ss = load(args.tool)
     if args.action in ("resume", "cmd"):
@@ -233,18 +335,27 @@ def main():
         ss = [s for s in ss if s["interactive"]]
     if args.dir:
         ss = [s for s in ss if args.dir in s["cwd"] or args.dir in short_dir(s["cwd"])]
+    if args.search:
+        matched = []
+        for s in ss:
+            hits, snippet = search_session(s, args.search)
+            if hits:
+                s["hits"], s["snippet"] = hits, snippet
+                matched.append(s)
+        ss = matched
     ss.sort(key=lambda s: -s["mtime"])
     if not ss:
-        print("no sessions found"); return
+        print("no sessions found" + ("" if args.headless else c(DIM, "  (headless runs hidden, add -H)"))); return
 
     if not args.by_dir:
         limit = None if args.all else (args.n or 40)
         rows = ss[:limit] if limit else ss
         print_header(show_dir=True)
         for s in rows:
-            print_row(s, show_dir=True)
+            print_row(s, show_dir=True, term=args.search)
         if len(rows) < len(ss):
-            print(f"  … {len(ss) - len(rows)} more (-a for all, -n N for more)")
+            print(c(DIM, f"  … {len(ss) - len(rows)} more (-a for all, -n N for more)"))
+        print_footer(len(rows), len(ss), args.headless)
     else:
         per_dir = args.n or 3
         groups = {}
@@ -253,13 +364,13 @@ def main():
         for cwd, items in groups.items():     # already newest-first by insertion
             shown = items if args.all else items[:per_dir]
             extra = len(items) - len(shown)
-            print(f"\n{short_dir(cwd)}  ({len(items)} session{'s' if len(items) != 1 else ''})")
+            print(f"\n{c(BOLD, short_dir(cwd))}  {c(DIM, f'({len(items)} session' + ('s' if len(items) != 1 else '') + ')')}")
             for s in shown:
-                print_row(s)
+                print_row(s, term=args.search)
             if extra:
-                print(f"  … {extra} more:  sessions -a -d {short_dir(cwd)}")
-    note = "" if args.headless else "  (headless runs hidden; -H to include)"
-    print(f"\n{len(ss)} sessions{note}\nResume:  sessions resume <id>     Print command:  sessions cmd <id>")
+                print(c(DIM, f"  … {extra} more:  sessions -a -d {short_dir(cwd)}"))
+        print_footer(sum(min(len(v), 10**9 if args.all else per_dir) for v in groups.values()), len(ss), args.headless)
+
 
 if __name__ == "__main__":
     main()
