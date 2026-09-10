@@ -23,17 +23,39 @@ CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
 CLAUDE_HISTORY = os.path.join(HOME, ".claude", "history.jsonl")
 CODEX_INTERACTIVE = {"codex-tui", "codex_vscode"}
 HEAD_LINES = 400          # how far into a transcript to look for cwd + first prompt
-TITLE_LEN = 60
+TITLE_MAX = 100           # never show more title than this even on a very wide terminal
+TITLE_MIN = 24            # below this we start squeezing the directory column instead
+DIR_MAX = 34
+DIR_MIN = 14
 SNIPPET_LEN = 90
-DIR_LEN = 34
+FIXED_COLS = 38           # flag, tool, age, id, prompt count and their spacing (dir column excluded)
+import shutil
 
 def is_uuid(name):
     parts = name.split("-")
     return len(name) == 36 and [len(p) for p in parts] == [8, 4, 4, 4, 12]
 
 def clean_title(text):
-    text = " ".join(text.split())
-    return text if len(text) <= TITLE_LEN else text[:TITLE_LEN - 1] + "…"
+    """Collapse whitespace; truncation to the terminal happens at render time."""
+    return " ".join(text.split())[:300]
+
+def fit(text, n):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+def layout(rows, show_dir):
+    """Pick directory and title widths for the current terminal."""
+    width = shutil.get_terminal_size((100, 24)).columns
+    dir_w = 0
+    if show_dir:
+        longest = max((len(short_dir(s["cwd"])) for s in rows), default=DIR_MIN)
+        dir_w = min(DIR_MAX, max(DIR_MIN, longest))
+    title_w = width - FIXED_COLS - (dir_w + 2 if show_dir else 0) - 1
+    if show_dir and title_w < TITLE_MIN:              # squeeze the directory before the title
+        give = min(dir_w - DIR_MIN, TITLE_MIN - title_w)
+        dir_w -= give
+        title_w += give
+    title_w = max(12, min(TITLE_MAX, title_w))
+    return dict(width=width, dir_w=dir_w, title_w=title_w)
 
 def junk_prompt(text):
     t = text.lstrip()
@@ -200,8 +222,8 @@ def search_session(s, term):
                         hits += 1
                         if snippet is None:
                             start = max(0, i - SNIPPET_LEN // 3)
-                            frag = " ".join(text[start:start + SNIPPET_LEN].split())
-                            snippet = ("…" if start else "") + frag + ("…" if start + SNIPPET_LEN < len(text) else "")
+                            frag = " ".join(text[start:start + SNIPPET_LEN * 3].split())
+                            snippet = ("…" if start else "") + frag
                         i = low.find(needle, i + len(needle))
     except OSError:
         pass
@@ -244,9 +266,9 @@ def find(ss, prefix):
         sys.exit("ambiguous prefix, be more specific")
     return hits[0]
 
-def trunc_dir(path):
+def trunc_dir(path, n):
     d = short_dir(path)
-    return d if len(d) <= DIR_LEN else "…" + d[-(DIR_LEN - 1):]
+    return d if len(d) <= n else "…" + d[-(n - 1):]
 
 def highlight(text, term, restore=None):
     """Colour the first occurrence of term; `restore` re-applies an outer style after the reset."""
@@ -258,18 +280,21 @@ def highlight(text, term, restore=None):
     tail = (f"\033[{restore}m" if restore else "") + text[i + len(term):]
     return text[:i] + c(YELLOW, text[i:i + len(term)]) + tail
 
-def print_row(s, show_dir=False, term=None):
+def print_row(s, L, show_dir=False, term=None):
     flag = " " if s["interactive"] else c(DIM, "*")
     tool = c(TOOL_COLOR[s["tool"]], f"{s['tool']:6}")
-    d = c(DIM, f"{trunc_dir(s['cwd']):<{DIR_LEN}}") + "  " if show_dir else ""
-    print(f" {flag}{tool} {age(s['mtime']):>4}  {c(CYAN, s['id'][:13])}  {d}{s['prompts']:>3}p  {highlight(s['title'], term)}")
+    d = c(DIM, f"{trunc_dir(s['cwd'], L['dir_w']):<{L['dir_w']}}") + "  " if show_dir else ""
+    title = highlight(fit(s["title"], L["title_w"]), term)
+    print(f" {flag}{tool} {age(s['mtime']):>4}  {c(CYAN, s['id'][:13])}  {d}{s['prompts']:>3}p  {title}")
     if term and s.get("snippet"):
-        indent = " " * (28 + (DIR_LEN + 2 if show_dir else 0))
+        indent = 28 + (L["dir_w"] + 2 if show_dir else 0)
         hits = f"{s['hits']} hit" + ("s" if s["hits"] != 1 else "")
-        print(f"{indent}{c(DIM, hits)}  {c(DIM, highlight(s['snippet'], term, restore=DIM))}")
+        room = max(20, L["width"] - indent - len(hits) - 3)
+        snip = fit(s["snippet"], room)
+        print(f"{' ' * indent}{c(DIM, hits)}  {c(DIM, highlight(snip, term, restore=DIM))}")
 
-def print_header(show_dir=False):
-    d = f"{'directory':<{DIR_LEN}}  " if show_dir else ""
+def print_header(L, show_dir=False):
+    d = f"{'directory':<{L['dir_w']}}  " if show_dir else ""
     print(c(DIM, f"  {'tool':6} {'age':>4}  {'id':13}  {d}{'':>3}   title"))
 
 FLAG_HELP = [
@@ -350,14 +375,16 @@ def main():
     if not args.by_dir:
         limit = None if args.all else (args.n or 40)
         rows = ss[:limit] if limit else ss
-        print_header(show_dir=True)
+        L = layout(rows, show_dir=True)
+        print_header(L, show_dir=True)
         for s in rows:
-            print_row(s, show_dir=True, term=args.search)
+            print_row(s, L, show_dir=True, term=args.search)
         if len(rows) < len(ss):
             print(c(DIM, f"  … {len(ss) - len(rows)} more (-a for all, -n N for more)"))
         print_footer(len(rows), len(ss), args.headless)
     else:
         per_dir = args.n or 3
+        L = layout(ss, show_dir=False)
         groups = {}
         for s in ss:
             groups.setdefault(s["cwd"], []).append(s)
@@ -366,7 +393,7 @@ def main():
             extra = len(items) - len(shown)
             print(f"\n{c(BOLD, short_dir(cwd))}  {c(DIM, f'({len(items)} session' + ('s' if len(items) != 1 else '') + ')')}")
             for s in shown:
-                print_row(s, term=args.search)
+                print_row(s, L, term=args.search)
             if extra:
                 print(c(DIM, f"  … {extra} more:  sessions -a -d {short_dir(cwd)}"))
         print_footer(sum(min(len(v), 10**9 if args.all else per_dir) for v in groups.values()), len(ss), args.headless)

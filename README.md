@@ -19,7 +19,7 @@ flags
   ...
 ```
 
-The flag guide at the bottom is always printed, so you never have to remember the options. Output is coloured when stdout is a terminal. Set `NO_COLOR=1` or pass `--no-color` to turn that off.
+The table sizes itself to the terminal. Directory and title columns grow on a wide window and shrink on a narrow one, with the directory trimmed from the left so the project name survives. The flag guide at the bottom is always printed, so you never have to remember the options. Output is coloured when stdout is a terminal. Set `NO_COLOR=1` or pass `--no-color` to turn that off.
 
 ## The problem
 
@@ -94,7 +94,7 @@ Claude Code writes one `<uuid>.jsonl` per session under `~/.claude/projects/<enc
 
 Codex writes `rollout-<timestamp>-<uuid>.jsonl` under `~/.codex/sessions/YYYY/MM/DD/`. The first line is a `session_meta` record with the id, working directory, and the originator that started it. Thread names come from `~/.codex/session_index.jsonl` when Codex has assigned one.
 
-Last activity is the file's modification time. Titles are cut at 60 characters so rows fit on one line.
+Last activity is the file's modification time. Titles and directories are cut to whatever fits the current terminal width, so rows never wrap.
 
 Search does a cheap substring check on each raw line before parsing it as JSON, then only counts matches inside user and assistant text. That keeps a full scan fast and keeps tool output and system context out of the results.
 
